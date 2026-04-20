@@ -22,6 +22,7 @@ model = genai.GenerativeModel("gemini-2.5-flash-lite")
 
 app = FastAPI(title="Document summarizer")
 
+
 # Allow requests from the React dev server
 app.add_middleware(
     CORSMiddleware,
@@ -34,7 +35,7 @@ app.add_middleware(
 # ─── Rate limiting (in-memory, per session) ────────────────────────────────────
 # In production: use Redis + sliding window per authenticated user
 
-RATE_LIMIT_REQUESTS = 20   # max requests per window
+RATE_LIMIT_REQUESTS = 10   # max requests per window
 RATE_LIMIT_WINDOW = 60     # seconds
 
 request_timestamps: dict[str, list[float]] = defaultdict(list)
@@ -66,6 +67,19 @@ def estimate_cost(input_tokens: int, output_tokens: int) -> float:
 
 # State memory for the session
 document_state = {}
+session_quotas = {}
+
+@app.get("/api/rate-limit/{session_id}")
+async def get_limit(session_id: str):
+    # If it's a new session, start them at 10
+    if session_id not in session_quotas:
+        session_quotas[session_id] = 10
+        
+    return {
+        "remaining": session_quotas[session_id],
+        "limit": 10,
+        "window": 60
+    }
 
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -100,49 +114,65 @@ async def summarize_document(
     length: str = Form("medium"),
     focus_area: str = Form("general")
 ):
+    # 1. Validate Session
     if session_id not in document_state:
         raise HTTPException(status_code=404, detail="Session expired or invalid. Please re-upload.")
+    
+    # 2. Check Quota
+    # Initialize quota if it's the first time for this session
+    if session_id not in session_quotas:
+        session_quotas[session_id] = 10 
         
+    if session_quotas[session_id] <= 0:
+        raise HTTPException(status_code=429, detail="Rate limit reached for this session.")
+
+    # 3. Prepare AI Logic
     document_text = document_state[session_id]
     
-    # We add explicit word/sentence counts to force the AI to respect the hierarchy
     length_instructions = {
-        "short": (
-            "Provide a brief 1-paragraph summary (maximum 3 sentences). "
-            "Keep it under 60 words. Do not use any headers."
-        ),
-        "medium": (
-            "Provide a balanced 2-paragraph summary. Each paragraph must be at least 3-4 sentences long. "
-            "Aim for approximately 150-200 words total. Do not use bullet points."
-        ),
-        "long": (
-            "Provide a highly detailed and comprehensive summary. Use multiple subheadings, "
-            "at least 3 paragraphs, and bullet points for key details. Aim for 400+ words."
-        )
+        "short": "Provide a brief 1-paragraph summary (max 4 sentences, 100-150 words). No headers.",
+        "medium": "Provide a balanced 3-paragraph summary (200-350 words). No bullet points.",
+        "long": "Provide a detailed summary with subheadings and bullet points (400+ words)."
     }
     
     length_prompt = length_instructions.get(length, length_instructions["medium"])
     focus_prompt = (
-        f"Heavily focus the content on: {focus_area}." 
+        f"Heavily focus on: {focus_area}." 
         if focus_area.strip() and focus_area.lower() != "general" 
         else "Provide a comprehensive general overview."
     )
     
-    # Combined prompt with stricter persona and formatting rules
     prompt = (
-        f"You are a professional document analyst. Summarize the text below according to these STRICT requirements:\n\n"
+        f"You are a professional document analyst. Summarize strictly:\n"
         f"FORMAT: {length_prompt}\n"
         f"FOCUS: {focus_prompt}\n\n"
         f"DOCUMENT TEXT:\n{document_text[:30000]}"
     )
     
-    # Higher temperature (0.7) helps the model 'expand' more for medium/long responses
-    response = model.generate_content(
-        prompt,
-        generation_config={
-            "temperature": 0.7,
-            "top_p": 0.95,
+    # 4. Generate AI Content
+    try:
+        response = model.generate_content(
+            prompt,
+            generation_config={"temperature": 0.7, "top_p": 0.95}
+        )
+        
+        # 5. DEDUCT QUOTA (The "Magic" Step)
+        session_quotas[session_id] -= 1
+        
+        # Return summary AND the new cost/quota info if you like
+        return {
+            "summary": response.text,
+            "remaining": session_quotas[session_id]
         }
-    )
-    
-    return {"summary": response.text}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI Generation failed: {str(e)}")
+
+@app.get("/api/rate-limit/{session_id}")
+async def get_limit(session_id: str):
+    # This is where the values are created
+    return {
+        "remaining": 5, 
+        "limit": 10,
+        "window": 60
+    }
